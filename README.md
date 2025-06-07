@@ -49,7 +49,26 @@ An advanced, battery-powered **portable GPS speedometer** built with an ESP32 De
 | Encoder SW (button) | GPIO26     | With `INPUT_PULLUP`              |
 
 > **Power**: Use 3.3V for GPS, LCD, and Encoder. Do NOT apply 5V directly to ESP32 GPIOs.
+---
+⚡ Battery Voltage Divider Calculator
+To safely measure higher voltages (like 4.2V–5.0V) with the ESP32 ADC (max 3.3V), use a resistive divider:
 
+css
+Copy
+Edit
+BAT+ ── R1 ─┬───> GPIO36 (ADC input)
+            │
+           R2
+            │
+           GND
+🧮 Voltage at ADC = Vbattery × R2 / (R1 + R2)
+
+Recommended Values:
+Vbattery Max	R1	R2	Divider Ratio	ADC Voltage
+4.2V	100k	100k	0.5	2.1V
+5.0V	150k	100k	0.4	2.0V
+
+🔒 Keep ADC input under 3.3V to avoid damage.
 ---
 
 ## 📺 Screens
