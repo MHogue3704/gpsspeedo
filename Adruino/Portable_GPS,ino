@@ -1,0 +1,276 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <TinyGPSPlus.h>
+#include <Preferences.h>
+
+// === PIN DEFINITIONS ===
+#define LCD_I2C_ADDR 0x27
+#define PIN_GPS_RX   16
+#define PIN_GPS_TX   17
+#define PIN_BAT_ADC  36
+#define ENC_CLK      33  // A pin
+#define ENC_DT       25  // B pin
+#define ENC_SW       26  // Button
+
+LiquidCrystal_I2C lcd(LCD_I2C_ADDR, 20, 4);
+TinyGPSPlus gps;
+Preferences prefs;
+TaskHandle_t TaskGPS;
+
+RTC_DATA_ATTR int bootCount = 0;
+RTC_DATA_ATTR unsigned long sleepStart = 0;
+
+volatile bool systemReady = false;
+
+volatile double lastLat = 0.0, lastLon = 0.0;
+volatile double distanceMeters = 0.0;
+unsigned long runStartMillis = 0;
+unsigned long totalRunTime = 0;
+float maxSpeed = 0.0;
+bool backlightOn = true;
+
+// Encoder state
+volatile int8_t encoderDir = 0;  // +1 = CW, -1 = CCW
+volatile bool encoderMoved = false;
+bool lastBtnState = HIGH;
+unsigned long buttonDownTime = 0;
+const unsigned long LONG_PRESS_MS = 1000;
+
+// Motion
+unsigned long lastMovementMillis = 0;
+const unsigned long IDLE_TIMEOUT = 180000;
+
+// Speed smoothing
+#define SPEED_HISTORY_LEN 5
+float speedHistory[SPEED_HISTORY_LEN] = {0};
+int speedIndex = 0;
+
+// UI screens
+enum ScreenIndex {
+  SCREEN_SPEED = 0,
+  SCREEN_TRIP,
+  SCREEN_GPS,
+  SCREEN_STATS,
+  SCREEN_CONFIG,
+  SCREEN_SHUTDOWN,
+  SCREEN_COUNT
+};
+int currentScreen = SCREEN_SPEED;
+
+// === Encoder ISR ===
+void IRAM_ATTR handleEncoder() {
+  bool clk = digitalRead(ENC_CLK);
+  bool dt  = digitalRead(ENC_DT);
+  encoderDir = (clk != dt) ? +1 : -1;
+  encoderMoved = true;
+}
+
+// === Utils ===
+float knotsToMph(float kn) { return kn * 1.15078f; }
+
+float getSmoothedSpeed() {
+  float sum = 0;
+  for (float s : speedHistory) sum += s;
+  return sum / SPEED_HISTORY_LEN;
+}
+
+const char* gpsCardinal(float course) {
+  static const char* dir[] = {
+    "N ", "NNE", "NE", "ENE", "E ", "ESE", "SE", "SSE",
+    "S ", "SSW", "SW", "WSW", "W ", "WNW", "NW", "NNW"
+  };
+  int idx = int((course + 11.25) / 22.5);
+  return dir[idx % 16];
+}
+
+void resetTrip() {
+  distanceMeters = 0.0;
+  totalRunTime = 0;
+  runStartMillis = millis();
+  maxSpeed = 0.0;
+}
+
+void saveTripToNVS() {
+  prefs.begin("tripdata", false);
+  prefs.putDouble("distance", distanceMeters);
+  prefs.putDouble("lat", lastLat);
+  prefs.putDouble("lon", lastLon);
+  prefs.putULong("runtime", totalRunTime + (millis() - runStartMillis));
+  prefs.end();
+}
+
+void loadTripFromNVS() {
+  prefs.begin("tripdata", true);
+  distanceMeters = prefs.getDouble("distance", 0.0);
+  lastLat = prefs.getDouble("lat", 0.0);
+  lastLon = prefs.getDouble("lon", 0.0);
+  totalRunTime = prefs.getULong("runtime", 0);
+  prefs.end();
+}
+
+// === Setup ===
+void setup() {
+  Serial.begin(115200);
+  bootCount++;
+  Wire.begin(21, 22);
+  lcd.init(); lcd.backlight(); lcd.clear();
+  lcd.setCursor(2, 0); lcd.print("Michael Hogue");
+  lcd.setCursor(4, 1); lcd.print("GPS Speedo");
+  delay(2000); lcd.clear();
+
+  Serial1.begin(9600, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
+  analogReadResolution(12);
+
+  pinMode(ENC_CLK, INPUT_PULLUP);
+  pinMode(ENC_DT, INPUT_PULLUP);
+  pinMode(ENC_SW, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(ENC_CLK), handleEncoder, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_DT),  handleEncoder, CHANGE);
+
+  loadTripFromNVS();
+  runStartMillis = millis();
+  if (sleepStart > 0) totalRunTime += millis() - sleepStart;
+
+  delay(200);
+  xTaskCreatePinnedToCore(gpsTask, "GPS Task", 4096, NULL, 1, &TaskGPS, 0);
+  systemReady = true;
+}
+
+// === Main Loop ===
+void loop() {
+  if (encoderMoved) {
+    encoderMoved = false;
+    currentScreen = (currentScreen + encoderDir + SCREEN_COUNT) % SCREEN_COUNT;
+    lcd.clear();
+    Serial.print("Encoder ");
+    Serial.print((encoderDir > 0) ? "CW → " : "CCW → ");
+    Serial.print("screen ");
+    Serial.println(currentScreen);
+  }
+
+  bool btn = digitalRead(ENC_SW);
+  if (btn == LOW && lastBtnState == HIGH) buttonDownTime = millis();
+  else if (btn == HIGH && lastBtnState == LOW) {
+    unsigned long held = millis() - buttonDownTime;
+    if (held > LONG_PRESS_MS) {
+      if (currentScreen == SCREEN_SHUTDOWN) {
+        saveTripToNVS(); sleepStart = millis();
+        lcd.clear(); lcd.setCursor(0, 0); lcd.print("Manual Shutdown...");
+        delay(1000); lcd.noBacklight();
+        esp_sleep_enable_timer_wakeup(180000000ULL);
+        esp_deep_sleep_start();
+      } else if (currentScreen == SCREEN_CONFIG) {
+        resetTrip(); lcd.clear(); lcd.print("Trip Reset"); delay(1000); lcd.clear();
+      }
+    } else {
+      if (currentScreen == SCREEN_CONFIG) {
+        backlightOn = !backlightOn;
+        if (backlightOn) lcd.backlight();
+        else lcd.noBacklight();
+      }
+    }
+  }
+  lastBtnState = btn;
+
+  float adc = analogRead(PIN_BAT_ADC);
+  float v = (adc / 4095.0f) * 3.3f * 2.0f;
+  float battPct = constrain((v - 3.0f) / 1.2f * 100.0f, 0, 100);
+
+  float rawSpeed = gps.speed.isValid() ? knotsToMph(gps.speed.knots()) : 0.0;
+  speedHistory[speedIndex++] = rawSpeed;
+  speedIndex %= SPEED_HISTORY_LEN;
+  float smoothSpeed = getSmoothedSpeed();
+  if (smoothSpeed > maxSpeed) maxSpeed = smoothSpeed;
+  if (smoothSpeed > 0.5) lastMovementMillis = millis();
+
+  if (millis() - lastMovementMillis > IDLE_TIMEOUT) {
+    saveTripToNVS(); sleepStart = millis();
+    lcd.clear(); lcd.print("Auto Sleep...");
+    delay(1000); lcd.noBacklight();
+    esp_sleep_enable_timer_wakeup(180000000ULL);
+    esp_deep_sleep_start();
+  }
+
+  lcd.setCursor(0, 0);
+  switch (currentScreen) {
+    case SCREEN_SPEED:
+      lcd.print("Speed & Direction ");
+      lcd.setCursor(0, 1);
+      lcd.print("Spd: "); lcd.print(smoothSpeed, 1); lcd.print(" mph     ");
+      lcd.setCursor(0, 2);
+      if (gps.course.isValid()) {
+        lcd.print("Dir: ");
+        lcd.print(gpsCardinal(gps.course.deg())); lcd.print(" ");
+        lcd.print((int)gps.course.deg()); lcd.print((char)223);
+      } else lcd.print("Dir: ---          ");
+      break;
+
+    case SCREEN_TRIP: {
+      lcd.print("Trip Info         ");
+      lcd.setCursor(0, 1);
+      lcd.print("Dist: "); lcd.print(distanceMeters / 1609.344, 2); lcd.print(" mi");
+      lcd.setCursor(0, 2);
+      unsigned long elapsed = millis() - runStartMillis + totalRunTime;
+      char buf[9];
+      sprintf(buf, "%02lu:%02lu:%02lu", elapsed / 3600000UL, (elapsed / 60000UL) % 60, (elapsed / 1000UL) % 60);
+      lcd.print("Time: "); lcd.print(buf);
+      break;
+    }
+
+    case SCREEN_GPS:
+      lcd.print("GPS Status        ");
+      lcd.setCursor(0, 1); lcd.print("Sats: "); lcd.print(gps.satellites.value());
+      lcd.setCursor(0, 2); lcd.print("Fix: ");
+      lcd.print(gps.location.isValid() ? "YES" : "NO ");
+      lcd.print(" Age: "); lcd.print(gps.location.age() / 1000); lcd.print("s");
+      break;
+
+    case SCREEN_STATS:
+      lcd.print("Trip Stats        ");
+      lcd.setCursor(0, 1); lcd.print("Max: "); lcd.print(maxSpeed, 1); lcd.print(" mph ");
+      lcd.setCursor(0, 2);
+      if (totalRunTime > 0) {
+        float avg = (distanceMeters / 1609.344) / (totalRunTime / 3600000.0f);
+        lcd.print("Avg: "); lcd.print(avg, 1); lcd.print(" mph ");
+      } else lcd.print("Avg: ---.- mph");
+      break;
+
+    case SCREEN_CONFIG:
+      lcd.print("Config            ");
+      lcd.setCursor(0, 1); lcd.print("Hold Btn = Reset  ");
+      lcd.setCursor(0, 2); lcd.print("Backlight: ");
+      lcd.print(backlightOn ? "ON " : "OFF");
+      break;
+
+    case SCREEN_SHUTDOWN:
+      lcd.print("Shut Down Unit    ");
+      lcd.setCursor(0, 1); lcd.print("Hold Btn = Sleep  ");
+      lcd.setCursor(0, 2); lcd.print("Release = Cancel  ");
+      break;
+  }
+
+  delay(200);
+}
+
+// === GPS TASK (Core 0) ===
+void gpsTask(void *pvParameters) {
+  while (!systemReady) {
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+
+  for (;;) {
+    while (Serial1.available()) {
+      gps.encode(Serial1.read());
+      if (gps.location.isUpdated() && gps.location.isValid()) {
+        double currLat = gps.location.lat();
+        double currLon = gps.location.lng();
+        double d = TinyGPSPlus::distanceBetween(lastLat, lastLon, currLat, currLon);
+        distanceMeters += d;
+        lastLat = currLat;
+        lastLon = currLon;
+      }
+    }
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+}
